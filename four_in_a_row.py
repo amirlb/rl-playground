@@ -8,6 +8,10 @@ import random
 import math
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
 class Board:
     ROWS = 6
@@ -237,7 +241,7 @@ def main():
     elo_values = evaluate_elo(n_playouts_list, n_games=50)
     print("Playouts:", n_playouts_list)
     print("ELO ratings:", elo_values)
-    plot_elo(n_playouts_list, elo_values)
+    # plot_elo(n_playouts_list, elo_values)
 
     # all-vs-all tournament
     agents = [RandomAgent(seed=0)] + [MCTSAgent(RandomAgent(seed=1), n) for n in n_playouts_list]
@@ -247,7 +251,184 @@ def main():
     ratings = estimate_elo_matrix(results)
     for name, r in zip(names, ratings):
         print(f"{name}: {r:.1f}")
-    plot_elo_matrix(names, ratings)
+    # plot_elo_matrix(names, ratings)
+
+    # DL self-play training
+    print("Starting DL self-play training...")
+    elos, versions = train_selfplay(n_iters=5, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000)
+    print("DL Training Elo progression:", elos)
+    plot_dl_progress(elos)
+
+    # Deep learning agent modules
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, n_heads, mlp_dim):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.ReLU(),
+            nn.Linear(mlp_dim, dim)
+        )
+
+    def forward(self, x):
+        y = self.ln1(x)
+        y, _ = self.attn(y, y, y)
+        x = x + y
+        y = self.mlp(self.ln2(x))
+        return x + y
+
+class FourInARowNet(nn.Module):
+    """Transformer-based network for win-probability estimation."""
+    def __init__(self, dim=64, n_blocks=4, n_heads=4, mlp_dim=128):
+        super().__init__()
+        self.embed = nn.Linear(2, dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim, n_heads, mlp_dim) for _ in range(n_blocks)
+        ])
+        # single-logit sigmoid head
+        self.head = nn.Sequential(
+            nn.Linear(dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):  # x: (batch, 42, 2)
+        x = self.embed(x)                 # (batch, 42, dim)
+        x = x.permute(1, 0, 2)            # (42, batch, dim)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.permute(1, 0, 2)            # (batch, 42, dim)
+        x = x.mean(dim=1)                 # (batch, dim)
+        prob = self.head(x)               # (batch, 1)
+        return prob.squeeze(-1)           # (batch,)
+
+class DLAgent:
+    """Agent using the network to pick moves (no search)."""
+    def __init__(self, net, device='cpu'):
+        self.net = net.to(device)
+        self.device = device
+        self.net.eval()
+
+    def select_move(self, board):
+        moves = board.legal_moves()
+        best_p, best_move = -float('inf'), None
+        for m in moves:
+            bcopy = board.clone()
+            win, draw = bcopy.play_move(m)
+            state = board_to_tensor(bcopy).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                p_tensor = self.net(state)  # (1,) probability of win
+            p = p_tensor[0].item()
+            if p > best_p:
+                best_p, best_move = p, m
+        return best_move
+
+# Utilities for DL self-play and training
+
+def board_to_tensor(board):
+    """Convert board to tensor of shape (42,2)."""
+    flat = [cell for row in board.grid for cell in row]
+    a = torch.tensor([1 if v==1 else 0 for v in flat], dtype=torch.float32)
+    b = torch.tensor([1 if v==-1 else 0 for v in flat], dtype=torch.float32)
+    return torch.stack([a, b], dim=1)
+
+
+def generate_selfplay_data(agent, n_games):
+    """Run self-play, collect (state, label) pairs for win-loss classification."""
+    data = []
+    for _ in range(n_games):
+        board = Board()
+        sim_id = 1
+        states = []  # (Board, sim_id)
+        while True:
+            states.append((board.clone(), sim_id))
+            move = agent.select_move(board)
+            win, draw = board.play_move(move)
+            if win or draw:
+                result = 1 if win else 0
+                for st, sid in states:
+                    label = result if sid == 1 else (1 - result)
+                    if label in (0, 1):
+                        t = board_to_tensor(st)
+                        data.append((t, int(label)))
+                break
+            sim_id *= -1
+    return data
+
+
+def evaluate_agent_vs(agent, opponent, n_games=50):
+    """Return Elo rating difference of agent vs opponent."""
+    wins = draws = losses = 0
+    for i in range(n_games):
+        board = Board()
+        players = [agent, opponent] if i % 2 == 0 else [opponent, agent]
+        turn = 0
+        while True:
+            cur = players[turn % 2]
+            move = cur.select_move(board)
+            win, draw = board.play_move(move)
+            if win:
+                if cur is agent: wins += 1
+                else: losses += 1
+                break
+            if draw:
+                draws += 1
+                break
+            turn += 1
+    p = (wins + 0.5 * draws) / n_games
+    if p <= 0: return -float('inf')
+    if p >= 1: return float('inf')
+    return -400 * math.log10(1 / p - 1)
+
+
+def train_selfplay(n_iters=50, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000):
+    """Run self-play training, return Elo progression and saved state_dicts."""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    net = FourInARowNet()
+    optimizer = optim.Adam(net.parameters(), lr=lr)
+    # use binary cross-entropy for single-sigmoid output
+    criterion = nn.BCELoss()
+    buffer = []
+    elos = [0.0]  # initial vs random
+    versions = [net.state_dict()]
+    random_agent = RandomAgent(seed=0)
+    for it in range(1, n_iters + 1):
+        agent = DLAgent(net, device)
+        data = generate_selfplay_data(agent, games_per_iter)
+        buffer += data
+        if len(buffer) > buffer_max:
+            buffer = buffer[-buffer_max:]
+        # Training epochs
+        net.train()
+        for _ in range(epochs):
+            random.shuffle(buffer)
+            for i in range(0, len(buffer), batch_size):
+                batch = buffer[i:i+batch_size]
+                states = torch.stack([s for s, _ in batch]).to(device)
+                labels = torch.tensor([l for _, l in batch], dtype=torch.float32).to(device)
+                preds = net(states)             # (batch,) probabilities
+                loss = criterion(preds, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        net.eval()
+        # Evaluate current net vs random
+        score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=50)
+        elos.append(score)
+        versions.append(net.state_dict())
+        print(f"Iteration {it}: Elo vs Random = {score:.1f}")
+    return elos, versions
+
+def plot_dl_progress(elos):
+    plt.figure()
+    plt.plot(range(len(elos)), elos, marker='o')
+    plt.xlabel('Iteration')
+    plt.ylabel('Elo vs Random')
+    plt.title('DL Agent Training Progress')
+    plt.grid(True)
+    plt.show()
 
 if __name__ == '__main__':
     main()
