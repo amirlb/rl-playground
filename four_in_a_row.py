@@ -10,8 +10,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+
+# Select best device: MPS (Mac NPU), CUDA, or CPU
+if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    default_device = torch.device('mps')
+elif torch.cuda.is_available():
+    default_device = torch.device('cuda')
+else:
+    default_device = torch.device('cpu')
+print(f"Using device: {default_device}")
 
 class Board:
     ROWS = 6
@@ -237,11 +245,14 @@ def plot_elo_matrix(names, ratings):
     plt.show()
 
 def main():
+    torch.set_num_threads(11)
+    torch.set_num_interop_threads(11)
+
     n_playouts_list = [1, 5, 10, 20, 50]
     elo_values = evaluate_elo(n_playouts_list, n_games=50)
     print("Playouts:", n_playouts_list)
     print("ELO ratings:", elo_values)
-    # plot_elo(n_playouts_list, elo_values)
+    plot_elo(n_playouts_list, elo_values)
 
     # all-vs-all tournament
     agents = [RandomAgent(seed=0)] + [MCTSAgent(RandomAgent(seed=1), n) for n in n_playouts_list]
@@ -251,11 +262,11 @@ def main():
     ratings = estimate_elo_matrix(results)
     for name, r in zip(names, ratings):
         print(f"{name}: {r:.1f}")
-    # plot_elo_matrix(names, ratings)
+    plot_elo_matrix(names, ratings)
 
     # DL self-play training
     print("Starting DL self-play training...")
-    elos, versions = train_selfplay(n_iters=5, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000)
+    elos, versions = train_selfplay(n_iters=100, games_per_iter=100, epochs=3, batch_size=32, lr=1e-5, buffer_max=10000)
     print("DL Training Elo progression:", elos)
     plot_dl_progress(elos)
 
@@ -284,79 +295,119 @@ class FourInARowNet(nn.Module):
     """Transformer-based network for win-probability estimation."""
     def __init__(self, dim=64, n_blocks=4, n_heads=4, mlp_dim=128):
         super().__init__()
-        self.embed = nn.Linear(2, dim)
+        # input features are fixed 64-dim: one-hot pos (42), self bit, opp bit, zeros (20)
         self.blocks = nn.ModuleList([
             TransformerBlock(dim, n_heads, mlp_dim) for _ in range(n_blocks)
         ])
-        # single-logit sigmoid head
         self.head = nn.Sequential(
-            nn.Linear(dim, 1),
+            nn.Linear(dim * 42, 1),
             nn.Sigmoid()
         )
 
-    def forward(self, x):  # x: (batch, 42, 2)
-        x = self.embed(x)                 # (batch, 42, dim)
+    def forward(self, x):  # x: (batch, 42, dim)
         x = x.permute(1, 0, 2)            # (42, batch, dim)
         for blk in self.blocks:
             x = blk(x)
         x = x.permute(1, 0, 2)            # (batch, 42, dim)
-        x = x.mean(dim=1)                 # (batch, dim)
+        batch_size, seq_len, d = x.shape
+        x = x.reshape(batch_size, seq_len * d)  # (batch, 42*dim)
         prob = self.head(x)               # (batch, 1)
         return prob.squeeze(-1)           # (batch,)
 
 class DLAgent:
     """Agent using the network to pick moves (no search)."""
-    def __init__(self, net, device='cpu'):
-        self.net = net.to(device)
+    def __init__(self, net, device='cpu', with_exploration=False):
+        self.net = net
         self.device = device
         self.net.eval()
+        self.with_exploration = with_exploration
 
     def select_move(self, board):
         moves = board.legal_moves()
-        best_p, best_move = -float('inf'), None
+        net_probs = {}
         for m in moves:
             bcopy = board.clone()
             win, draw = bcopy.play_move(m)
             state = board_to_tensor(bcopy).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 p_tensor = self.net(state)  # (1,) probability of win
-            p = p_tensor[0].item()
-            if p > best_p:
-                best_p, best_move = p, m
-        return best_move
+            net_probs[m] = p_tensor[0].item()
+        if self.with_exploration:
+            probs = {m: 0.01 + p**0.5 for m, p in net_probs.items()}
+            x = random.random() * sum(probs.values())
+            for m, p in probs.items():
+                x -= p
+                if x < 0:
+                    return m
+            raise Exception("Failed to select move")
+        else:
+            return max(net_probs, key=net_probs.get)
 
 # Utilities for DL self-play and training
 
 def board_to_tensor(board):
-    """Convert board to tensor of shape (42,2)."""
+    """Convert board to tensor of shape (42,64):
+    one-hot pos(42), self-piece(1), opp-piece(1), zeros(20)."""
+    # flatten grid
     flat = [cell for row in board.grid for cell in row]
-    a = torch.tensor([1 if v==1 else 0 for v in flat], dtype=torch.float32)
-    b = torch.tensor([1 if v==-1 else 0 for v in flat], dtype=torch.float32)
-    return torch.stack([a, b], dim=1)
+    # positional one-hot (42 x 42)
+    pos = torch.eye(42, dtype=torch.float32)
+    # piece presence bits
+    self_bits = torch.tensor([1.0 if v==1 else 0.0 for v in flat], dtype=torch.float32).unsqueeze(1)
+    opp_bits = torch.tensor([1.0 if v==-1 else 0.0 for v in flat], dtype=torch.float32).unsqueeze(1)
+    # padding zeros to reach 64 dims
+    pad = torch.zeros(42, 20, dtype=torch.float32)
+    # concatenate to (42, 64)
+    x = torch.cat([pos, self_bits, opp_bits, pad], dim=1)
+    return x
 
+def print_numbered_board(moves):
+    """Print a single final board with moves numbered on each cell."""
+    rows, cols = Board.ROWS, Board.COLS
+    n = len(moves)
+    width = len(str(n))
+    # track stack heights per column
+    heights = [0] * cols
+    # init grid with dots
+    grid = [[ '.' * width for _ in range(cols)] for _ in range(rows)]
+    for idx, col in enumerate(moves):
+        # compute row from bottom
+        row = rows - 1 - heights[col]
+        heights[col] += 1
+        grid[row][col] = str(idx+1).rjust(width)
+    # print rows top-down
+    for r in range(rows):
+        print(' '.join(grid[r]))
+    print()
 
-def generate_selfplay_data(agent, n_games):
+def generate_selfplay_data(agent, n_games, show_games=False):
     """Run self-play, collect (state, label) pairs for win-loss classification."""
     data = []
-    for _ in range(n_games):
+    for game_idx in range(n_games):
         board = Board()
         sim_id = 1
         states = []  # (Board, sim_id)
+        moves = []
         while True:
             states.append((board.clone(), sim_id))
             move = agent.select_move(board)
+            moves.append(move)
             win, draw = board.play_move(move)
             if win or draw:
+                # include final board position (after move) in states
+                # perspective has been inverted, so flip sim_id
+                states.append((board.clone(), -sim_id))
+                # print every 20th game
+                if show_games and game_idx % 20 == 19:
+                    print(f"---- Self-play Game {game_idx+1} ----")
+                    print_numbered_board(moves)
                 result = 1 if win else 0
                 for st, sid in states:
                     label = result if sid == 1 else (1 - result)
-                    if label in (0, 1):
-                        t = board_to_tensor(st)
-                        data.append((t, int(label)))
+                    data.append((board_to_tensor(st), label))
                 break
             sim_id *= -1
     return data
-
 
 def evaluate_agent_vs(agent, opponent, n_games=50):
     """Return Elo rating difference of agent vs opponent."""
@@ -382,43 +433,63 @@ def evaluate_agent_vs(agent, opponent, n_games=50):
     if p >= 1: return float('inf')
     return -400 * math.log10(1 / p - 1)
 
-
-def train_selfplay(n_iters=50, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000):
+def train_selfplay(n_iters=5, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000):
     """Run self-play training, return Elo progression and saved state_dicts."""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    net = FourInARowNet()
+    # use default selected device (MPS/CUDA/CPU)
+    device = default_device
+    net = FourInARowNet(n_blocks=2).to(device)
     optimizer = optim.Adam(net.parameters(), lr=lr)
     # use binary cross-entropy for single-sigmoid output
     criterion = nn.BCELoss()
     buffer = []
-    elos = [0.0]  # initial vs random
-    versions = [net.state_dict()]
+    elos = []
+    versions = []
     random_agent = RandomAgent(seed=0)
+    # Evaluate current net vs random
+    score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=50)
+    elos.append(score)
+    versions.append(net.state_dict())
+    print(f"Before training: Elo vs Random = {score:.1f}")
     for it in range(1, n_iters + 1):
-        agent = DLAgent(net, device)
-        data = generate_selfplay_data(agent, games_per_iter)
-        buffer += data
-        if len(buffer) > buffer_max:
-            buffer = buffer[-buffer_max:]
-        # Training epochs
-        net.train()
-        for _ in range(epochs):
-            random.shuffle(buffer)
-            for i in range(0, len(buffer), batch_size):
-                batch = buffer[i:i+batch_size]
-                states = torch.stack([s for s, _ in batch]).to(device)
-                labels = torch.tensor([l for _, l in batch], dtype=torch.float32).to(device)
-                preds = net(states)             # (batch,) probabilities
-                loss = criterion(preds, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-        net.eval()
-        # Evaluate current net vs random
-        score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=50)
-        elos.append(score)
-        versions.append(net.state_dict())
-        print(f"Iteration {it}: Elo vs Random = {score:.1f}")
+        try:
+            agent = DLAgent(net, device, with_exploration=True)
+            data = generate_selfplay_data(agent, games_per_iter)
+            buffer += data
+            if len(buffer) > buffer_max:
+                buffer = buffer[-buffer_max:]
+            # Training epochs
+            for epoch in range(1, epochs+1):
+                net.train()
+                random.shuffle(buffer)
+                running_loss = 0.0
+                correct = 0
+                total = 0
+                for i in range(0, len(buffer), batch_size):
+                    batch = buffer[i:i+batch_size]
+                    states = torch.stack([s for s, _ in batch]).to(device)
+                    labels = torch.tensor([l for _, l in batch], dtype=torch.float32).to(device)
+                    preds = net(states)
+                    loss = criterion(preds, labels)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    # accumulate loss and accuracy
+                    running_loss += loss.item() * labels.size(0)
+                    preds_label = (preds >= 0.5).float()
+                    correct += (preds_label == labels).sum().item()
+                    total += labels.size(0)
+                epoch_loss = running_loss / total
+                epoch_acc = correct / total
+                print(f"Iteration {it}, Epoch {epoch}: loss={epoch_loss:.4f}, acc={epoch_acc:.3f}")
+            net.eval()
+            # Evaluate current net vs random
+            score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=200)
+            elos.append(score)
+            versions.append(net.state_dict())
+            print(f"Iteration {it}: Elo vs Random = {score:.1f}")
+        except KeyboardInterrupt:
+            print("Training interrupted by user")
+            break
     return elos, versions
 
 def plot_dl_progress(elos):
