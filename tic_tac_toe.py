@@ -8,6 +8,16 @@ TTTPosition = tuple[int, int]
 TTTMove = int
 
 
+# Select best device: MPS (Mac NPU), CUDA, or CPU
+if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    default_device = torch.device('mps')
+elif torch.cuda.is_available():
+    default_device = torch.device('cuda')
+else:
+    default_device = torch.device('cpu')
+print(f"Using device: {default_device}")
+
+
 class TicTacToeGame(Game):
     LINES = [0b000000111, 0b000111000, 0b111000000, 0b001001001, 0b010010010, 0b100100100, 0b100010001, 0b001010100]
 
@@ -207,8 +217,8 @@ class DLOptimizer(ValueOptimizer):
                 data.append((board, ep.value * (-1)**i))
             data.append((ep.last_position, ep.value * (-1)**len(ep.decisions)))
         random.shuffle(data)
-        states = estimator._embed([board for board, _ in data])
-        targets = torch.tensor([value for _, value in data], dtype=torch.float32)
+        states = estimator._embed([board for board, _ in data]).to(default_device)
+        targets = torch.tensor([value for _, value in data], dtype=torch.float32).to(default_device)
         optimizer = torch.optim.SGD(estimator.parameters(), lr=self.lr)
         criterion = nn.MSELoss()
         for _ in range(self.epochs):
@@ -234,7 +244,7 @@ def main():
     # train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=OptimizerNaive2(m=0.1), estimator=estimator)
     # estimator = PytorchVectorValueEstimator()
     # train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=OptimizerNaive3(lr=0.05), estimator=estimator)
-    estimator = DLValueEstimator(n_blocks=1)
+    estimator = DLValueEstimator(n_blocks=1).to(default_device)
     train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=DLOptimizer(lr=0.1, epochs=3), estimator=estimator)
 
 
