@@ -189,7 +189,7 @@ class DLValueEstimator(nn.Module, ValueEstimator):
         return torch.tanh(score.squeeze(-1))          # (batch,)
 
     def value(self, board: TTTPosition) -> float:
-        return self.forward(self._embed([board])).item()
+        return self.forward(self._embed([board]).to(default_device)).item()
 
     @staticmethod
     def _embed(boards: list[TTTPosition]) -> torch.Tensor:
