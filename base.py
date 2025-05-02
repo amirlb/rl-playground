@@ -60,39 +60,16 @@ class ValuePlayer(Player):
         return random.choice(moves)
 
 
-class OptimalValueEstimator(ValueEstimator):
-    """Only use for games with a small number of states"""
-
-    def __init__(self, game):
-        self.game = game
-        self.values = {}
-        self.compute_value(game.starting_position())
-
-    def value(self, board: Board) -> float:
-        return self.values[board]
-
-    def compute_value(self, board: Board) -> None:
-        if board in self.values:
-            return
-        legal_moves, value = self.game.legal_moves(board)
-        if value is not None:
-            self.values[board] = value
-            return
-        for move in legal_moves:
-            self.compute_value(self.game.play_move(board, move))
-        self.values[board] = max(-self.values[self.game.play_move(board, move)] for move in legal_moves)
-
-
-class GameTreeIndexer(dict):
-    def __init__(self, game: Game):
-        super().__init__({board: i for i, board in enumerate(OptimalValueEstimator(game).values.keys())})
-
-
 @dataclass
 class Episode:
     decisions: list[tuple[Board, Move]]
     last_position: Board
     value: float
+
+
+class ValueOptimizer:
+    def train(self, episodes: list[Episode], estimator: ValueEstimator) -> None:
+        raise NotImplementedError
 
 
 def simulate_game(game: Game, player1: Player, player2: Player) -> Episode:
@@ -119,3 +96,17 @@ def gather_stats(game: Game, player1: Player, player2: Player, n_games: int) -> 
             episode = simulate_game(game, player2, player1)
             results[1 - episode.value] += 1
     return results
+
+
+def evaluate_against_random(game: Game, player: Player, name: str, n_games: int = 1000) -> float:
+    loss, draw, win = gather_stats(game, player, RandomPlayer(game), n_games)
+    print(f"Out of {n_games} games, {name}: wins: {win/n_games:5.1%}, draws: {draw/n_games:5.1%}, loss: {loss/n_games:5.1%}")
+
+
+def train_self_play(game: Game, n_iters: int, n_games_per_iter: int, estimator: ValueEstimator, exploration_rate: float, optimizer: ValueOptimizer) -> None:
+    evaluate_against_random(game, ValuePlayer(game, estimator), "Before training")
+    explorer = ValuePlayer(game, estimator, exploration_rate)
+    for i in range(n_iters):
+        episodes = [simulate_game(game, explorer, explorer) for _ in range(n_games_per_iter)]
+        optimizer.train(episodes, estimator)
+        evaluate_against_random(game, ValuePlayer(game, estimator), f"After {i + 1} iterations")
