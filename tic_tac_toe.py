@@ -1,5 +1,6 @@
 import random
 import torch
+import argparse
 from base import Episode, Game, GameTreeIndexer, OptimalValueEstimator, Player, RandomPlayer, ValueEstimator, ValuePlayer, gather_stats, simulate_game
 import torch.nn as nn
 
@@ -292,21 +293,76 @@ def evaluate_player(player: Player, name: str, n_games: int = 1000) -> float:
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Train TicTacToe AI using various methods')
+    parser.add_argument('--variant', type=str, choices=['naive1', 'naive2', 'naive3', 'naive4', 'naive5', 'dl'], 
+                      default='dl', help='Which training variant to use')
+    parser.add_argument('--exploration-rate', type=float, default=0.4,
+                      help='Exploration rate for training')
+    parser.add_argument('--n-iters', type=int, default=50,
+                      help='Number of training iterations')
+    parser.add_argument('--n-games-per-iter', type=int, default=100,
+                      help='Number of games to play per iteration')
+    parser.add_argument('--lr', type=float, default=0.1,
+                      help='Learning rate for optimizers that use it')
+    parser.add_argument('--max-diff', type=float, default=0.1,
+                      help='Maximum difference for OptimizerNaive1')
+    parser.add_argument('--m', type=float, default=0.1,
+                      help='Momentum parameter for OptimizerNaive2 and OptimizerNaive5')
+    parser.add_argument('--epochs', type=int, default=1,
+                      help='Number of epochs for DLValueEstimator')
+    parser.add_argument('--batch-size', type=int, default=32,
+                      help='Batch size for DLValueEstimator')
+    parser.add_argument('--n-blocks', type=int, default=0,
+                      help='Number of transformer blocks for DLValueEstimator')
+    parser.add_argument('--n-heads', type=int, default=4,
+                      help='Number of attention heads for DLValueEstimator')
+    parser.add_argument('--dim', type=int, default=16,
+                      help='Dimension of transformer for DLValueEstimator')
+    parser.add_argument('--mlp-dim', type=int, default=32,
+                      help='Dimension of MLP in transformer for DLValueEstimator')
+    args = parser.parse_args()
+
     random.seed(123)
     evaluate_player(RandomPlayer(TicTacToeGame), "Random")
     evaluate_player(ValuePlayer(TicTacToeGame, OptimalValueEstimator(TicTacToeGame)), "Optimal")
-    estimator = VectorValueEstimator()
-    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive1(max_diff=0.1), estimator=estimator)
-    estimator = VectorValueEstimator()
-    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive2(m=0.1), estimator=estimator)
-    estimator = VectorValueEstimator()
-    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive5(m=0.1), estimator=estimator)
-    estimator = PytorchVectorValueEstimator()
-    train_self_play(TicTacToeGame, n_iters=100, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive3(lr=0.05), estimator=estimator)
-    estimator = PytorchVectorValueEstimator()
-    train_self_play(TicTacToeGame, n_iters=100, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive4(lr=0.05), estimator=estimator)
-    estimator = DLValueEstimator(n_blocks=0).to(default_device)
-    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=DLOptimizer(lr=0.1, epochs=1), estimator=estimator)
+
+    if args.variant == 'naive1':
+        estimator = VectorValueEstimator()
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=OptimizerNaive1(max_diff=args.max_diff), 
+                       estimator=estimator)
+    elif args.variant == 'naive2':
+        estimator = VectorValueEstimator()
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=OptimizerNaive2(m=args.m), 
+                       estimator=estimator)
+    elif args.variant == 'naive3':
+        estimator = PytorchVectorValueEstimator()
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=OptimizerNaive3(lr=args.lr), 
+                       estimator=estimator)
+    elif args.variant == 'naive4':
+        estimator = PytorchVectorValueEstimator()
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=OptimizerNaive4(lr=args.lr), 
+                       estimator=estimator)
+    elif args.variant == 'naive5':
+        estimator = VectorValueEstimator()
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=OptimizerNaive5(m=args.m), 
+                       estimator=estimator)
+    elif args.variant == 'dl':
+        estimator = DLValueEstimator(n_blocks=args.n_blocks, n_heads=args.n_heads, 
+                                   dim=args.dim, mlp_dim=args.mlp_dim).to(default_device)
+        train_self_play(TicTacToeGame, n_iters=args.n_iters, n_games_per_iter=args.n_games_per_iter,
+                       exploration_rate=args.exploration_rate, 
+                       optimizer=DLOptimizer(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size), 
+                       estimator=estimator)
 
 
 if __name__ == '__main__':
