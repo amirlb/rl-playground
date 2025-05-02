@@ -144,7 +144,7 @@ class TorchOptimizerTD(ValueOptimizer):
         self.epochs = epochs
         self.batch_size = batch_size
 
-    def train(self, episodes: list[Episode], estimator: PytorchVectorValueEstimator) -> None:
+    def train(self, episodes: list[Episode], estimator: nn.Module) -> None:
         indices, targets = [], []
         intermed1, intermed2 = [], []
         for ep in episodes:

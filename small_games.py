@@ -34,19 +34,17 @@ class VectorValueEstimator(ValueEstimator):
         return self.values[self.index[board]]
 
 
-class PytorchVectorValueEstimator(ValueEstimator):
+class PytorchVectorValueEstimator(ValueEstimator, nn.Module):
     def __init__(self, game: Game):
+        super().__init__()
         self.index = FullGameTree(game).index
         self.values = nn.Parameter(torch.zeros(len(self.index), dtype=torch.float32))
 
     def value(self, board: Board) -> float:
         return self.values[self.index[board]]
 
-    def parameters(self):
-        return [self.values]
-
-    def __call__(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.values[indices]
+    def forward(self, x):
+        return self.values[x]
 
     def embed(self, boards: list[Board]) -> torch.Tensor:
         return torch.tensor([self.index[board] for board in boards], dtype=torch.long)
@@ -97,7 +95,7 @@ class OptimizerNaiveTD(ValueOptimizer):
     def __init__(self, m: float):
         self.m = m
 
-    def train(self, episodes: list[Episode], estimator: PytorchVectorValueEstimator) -> None:
+    def train(self, episodes: list[Episode], estimator: VectorValueEstimator) -> None:
         for ep in episodes:
             trajectory = [board for board, _ in ep.decisions] + [ep.last_position]
             self.update_towards(estimator, ep.last_position, ep.value * (-1)**len(ep.decisions))
