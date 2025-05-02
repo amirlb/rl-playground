@@ -1,16 +1,8 @@
-""" four_in_a_row.py
-
-A moderately-efficient library for four-in-a-row (7x6) with perspective invariance.
-Includes Board, RandomAgent, MCTSAgent, Elo evaluation and plotting.
-"""
-
 import random
-import math
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
+import argparse
 import torch.nn as nn
-import torch.optim as optim
+from base import Episode, Game, ValueEstimator, ValuePlayer, RandomPlayer, ValueOptimizer, evaluate_against_random, train_self_play
 
 # Select best device: MPS (Mac NPU), CUDA, or CPU
 if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -21,262 +13,134 @@ else:
     default_device = torch.device('cpu')
 print(f"Using device: {default_device}")
 
-class Board:
-    ROWS = 6
-    COLS = 7
 
-    def __init__(self):
-        # 0 empty, 1 current player's piece, -1 opponent's piece
-        self.grid = [[0 for _ in range(self.COLS)] for _ in range(self.ROWS)]
+# Board representation: (my_pieces, opponent_pieces)
+# Each is a bitmask representing the cells occupied by the player.
+# Cell indices (6 rows, 7 columns):
+# 35 36 37 38 39 40 41  (row 5)
+# 28 29 30 31 32 33 34  (row 4)
+# 21 22 23 24 25 26 27  (row 3)
+# 14 15 16 17 18 19 20  (row 2)
+#  7  8  9 10 11 12 13  (row 1)
+#  0  1  2  3  4  5  6  (row 0)
+FIARPosition = tuple[int, int]
+FIARMove = int  # Column index 0-6
 
-    def clone(self):
-        new = Board()
-        new.grid = [row.copy() for row in self.grid]
-        return new
+class FourInARow(Game):
+    WIDTH = 7
+    HEIGHT = 6
+    SIZE = WIDTH * HEIGHT
+    TOP_ROW_MASK = ((1 << WIDTH) - 1) << (WIDTH * (HEIGHT - 1))
 
-    def legal_moves(self):
-        return [c for c in range(self.COLS) if self.grid[0][c] == 0]
+    @classmethod
+    def starting_position(cls) -> FIARPosition:
+        return (0, 0)
 
-    def play_move(self, col):
-        # drop piece for current player (1)
-        for r in range(self.ROWS - 1, -1, -1):
-            if self.grid[r][col] == 0:
-                self.grid[r][col] = 1
-                win = self._check_win_cell(r, col)
-                draw = (all(self.grid[0][c] != 0 for c in range(self.COLS)) and not win)
-                # invert perspective: flip all non-zero cells
-                for i in range(self.ROWS):
-                    for j in range(self.COLS):
-                        self.grid[i][j] = -self.grid[i][j]
-                return win, draw
-        raise ValueError(f"Column {col} is full")
+    @classmethod
+    def fmt(cls, board: FIARPosition) -> str:
+        my, other = board
+        lines = []
+        for r in reversed(range(cls.HEIGHT)):
+            line = []
+            for c in range(cls.WIDTH):
+                idx = r * cls.WIDTH + c
+                if my & (1 << idx):
+                    line.append('X')
+                elif other & (1 << idx):
+                    line.append('O')
+                else:
+                    line.append('.')
+            lines.append(" ".join(line))
+        return "\\n".join(lines)
 
-    def _check_win_cell(self, r, c):
-        # check 4 in a row including cell (r,c) for value 1
-        directions = [(1,0), (0,1), (1,1), (1,-1)]
-        for dr, dc in directions:
-            count = 1
-            # check both directions
-            for step in (1, -1):
-                rr, cc = r, c
-                while True:
-                    rr += dr * step
-                    cc += dc * step
-                    if 0 <= rr < self.ROWS and 0 <= cc < self.COLS and self.grid[rr][cc] == 1:
-                        count += 1
-                    else:
-                        break
-            if count >= 4:
-                return True
+    @classmethod
+    def _check_win(cls, player_board: int) -> bool:
+        # Horizontal
+        m = player_board & (player_board >> 1) & (player_board >> 2) & (player_board >> 3)
+        # Need to mask out wins wrapping around columns - check every 4 positions if they cross boundaries
+        for r in range(cls.HEIGHT):
+            for c in range(cls.WIDTH - 3):
+                 mask = (0b1111 << (r * cls.WIDTH + c))
+                 if (player_board & mask) == mask: return True
+
+        # Vertical
+        m = player_board & (player_board >> cls.WIDTH) & (player_board >> (2 * cls.WIDTH)) & (player_board >> (3 * cls.WIDTH))
+        if m != 0: return True
+
+        # Diagonal Down-Right (\)
+        m = player_board & (player_board >> (cls.WIDTH - 1)) & (player_board >> (2 * (cls.WIDTH - 1))) & (player_board >> (3 * (cls.WIDTH - 1)))
+        # Masking needed for diagonals
+        for r in range(cls.HEIGHT - 3):
+            for c in range(cls.WIDTH - 3):
+                 mask = (1 << (r*cls.WIDTH+c)) | (1 << ((r+1)*cls.WIDTH+c+1)) | \
+                        (1 << ((r+2)*cls.WIDTH+c+2)) | (1 << ((r+3)*cls.WIDTH+c+3))
+                 if (player_board & mask) == mask: return True
+
+
+        # Diagonal Up-Right (/)
+        m = player_board & (player_board >> (cls.WIDTH + 1)) & (player_board >> (2 * (cls.WIDTH + 1))) & (player_board >> (3 * (cls.WIDTH + 1)))
+        # Masking needed for diagonals
+        for r in range(3, cls.HEIGHT):
+             for c in range(cls.WIDTH - 3):
+                 mask = (1 << (r*cls.WIDTH+c)) | (1 << ((r-1)*cls.WIDTH+c+1)) | \
+                        (1 << ((r-2)*cls.WIDTH+c+2)) | (1 << ((r-3)*cls.WIDTH+c+3))
+                 if (player_board & mask) == mask: return True
+
         return False
 
-    def __str__(self):
-        symbols = {1: 'X', -1: 'O', 0: '.'}
-        rows = []
-        for row in self.grid:
-            rows.append(' '.join(symbols[v] for v in row))
-        return '\n'.join(rows)
+    @classmethod
+    def legal_moves(cls, board: FIARPosition) -> tuple[list[FIARMove], float | None]:
+        my, other = board
+        
+        if cls._check_win(my):
+             return [], 1 # Current player just made the move, previous player (other) won. -> Wait, perspective is current player. If `my` has winning lines, it means the *previous* move by `other` created this state, so `other` wins -> -1
+             # Let's re-evaluate. `legal_moves` is called *before* the current player moves. 
+             # If `other` made the last move and won, `other` board passed to this function would have a winning line.
+             # So, check `other` for win first.
+        if cls._check_win(other):
+             return [], -1 # Previous player (other) won
 
-class RandomAgent:
-    def __init__(self, seed=None):
-        self.random = random.Random(seed)
+        whole = my | other
+        if whole & cls.TOP_ROW_MASK == cls.TOP_ROW_MASK:
+            # Board is full
+             return [], 0 # Draw
 
-    def select_move(self, board):
-        moves = board.legal_moves()
-        return self.random.choice(moves)
+        moves = []
+        for c in range(cls.WIDTH):
+            # Check if the top cell of the column is empty
+            if not (whole & (1 << (c + (cls.HEIGHT - 1) * cls.WIDTH))):
+                moves.append(c)
+        
+        # If no moves possible, it's a draw (already checked above, but as safeguard)
+        if not moves: 
+             return [], 0
 
-def simulate_play(board, agent):
-    # simulate until terminal; return 1 if starting side (whose perspective is on board at start) wins, -1 if loses, 0 if draw
-    sim_identity = 1  # 1 for starting current player's side
-    while True:
-        move = agent.select_move(board)
-        win, draw = board.play_move(move)
-        if win:
-            return 1 if sim_identity == 1 else -1
-        if draw:
-            return 0
-        # flip identity: perspective has been inverted
-        sim_identity *= -1
+        return moves, None
 
-class MCTSAgent:
-    def __init__(self, playout_agent, n_playouts):
-        self.playout_agent = playout_agent
-        self.n_playouts = n_playouts
+    @classmethod
+    def play_move(cls, board: FIARPosition, move: FIARMove) -> FIARPosition:
+        my, other = board
+        whole = my | other
 
-    def select_move(self, board):
-        moves = board.legal_moves()
-        best_move = None
-        best_val = -float('inf')
-        for move in moves:
-            total = 0
-            for _ in range(self.n_playouts):
-                bcopy = board.clone()
-                win, draw = bcopy.play_move(move)
-                if win:
-                    result = 1
-                elif draw:
-                    result = 0
-                else:
-                    result = -simulate_play(bcopy, self.playout_agent)
-                total += result
-            avg = total / self.n_playouts
-            if avg > best_val:
-                best_val = avg
-                best_move = move
-        return best_move
+        # Find the lowest empty row in the chosen column 'move'
+        for r in range(cls.HEIGHT):
+            idx = r * cls.WIDTH + move
+            if not (whole & (1 << idx)):
+                # Place piece by setting the bit in 'my' board
+                new_my = my | (1 << idx)
+                return (other, new_my) # Swap players
 
-def evaluate_elo(n_playouts_list, n_games=50):
-    random_agent = RandomAgent(seed=0)
-    elo_list = []
-    for n in n_playouts_list:
-        mcts_agent = MCTSAgent(RandomAgent(seed=1), n)
-        wins = draws = losses = 0
-        for i in range(n_games):
-            board = Board()
-            # alternate who starts
-            if i % 2 == 0:
-                agents = [mcts_agent, random_agent]
-            else:
-                agents = [random_agent, mcts_agent]
-            turn = 0
-            while True:
-                current = agents[turn % 2]
-                move = current.select_move(board)
-                win, draw = board.play_move(move)
-                if win:
-                    if current is mcts_agent:
-                        wins += 1
-                    else:
-                        losses += 1
-                    break
-                if draw:
-                    draws += 1
-                    break
-                turn += 1
-        score = wins + 0.5 * draws
-        avg_score = score / n_games
-        if avg_score == 1:
-            rating = float('inf')
-        elif avg_score == 0:
-            rating = -float('inf')
-        else:
-            rating = -400 * math.log10(1 / avg_score - 1)
-        elo_list.append(rating)
-    return elo_list
+        # Should not happen if legal_moves is checked first
+        raise ValueError(f"Column {move} is full, cannot play move.")
 
-def plot_elo(n_playouts_list, elo_list):
-    plt.figure()
-    plt.plot(n_playouts_list, elo_list, marker='o')
-    plt.xlabel('Number of playouts per move')
-    plt.ylabel('ELO vs Random')
-    plt.title('ELO vs MCTS playouts')
-    plt.grid(True)
-    plt.show()
 
-# Add all-vs-all tournament functions
-def all_vs_all(agents, names, n_games=50):
-    """Return result matrix of win fractions for each agent pair."""
-    n = len(agents)
-    results = [[0]*n for _ in range(n)]
-    for i in range(n):
-        for j in range(i+1, n):
-            wins_i = draws = wins_j = 0
-            for g in range(n_games):
-                board = Board()
-                if g % 2 == 0:
-                    pair = (agents[i], agents[j])
-                else:
-                    pair = (agents[j], agents[i])
-                turn = 0
-                winner = None
-                while True:
-                    current = pair[turn % 2]
-                    move = current.select_move(board)
-                    win, draw = board.play_move(move)
-                    if win:
-                        winner = current
-                        break
-                    if draw:
-                        break
-                    turn += 1
-                if winner is None:
-                    draws += 1
-                elif winner is agents[i]:
-                    wins_i += 1
-                else:
-                    wins_j += 1
-            score_i = (wins_i + 0.5*draws) / n_games
-            score_j = (wins_j + 0.5*draws) / n_games
-            results[i][j] = score_i
-            results[j][i] = score_j
-    return results
-
-def estimate_elo_matrix(results):
-    """Estimate Elo ratings via least-squares on pairwise results."""
-    pairs = []
-    diffs = []
-    n = len(results)
-    for i in range(n):
-        for j in range(i+1, n):
-            p = results[i][j]
-            if p <= 0 or p >= 1:
-                continue
-            diff = -400 * math.log10(1 / p - 1)
-            pairs.append((i, j))
-            diffs.append(diff)
-    if not pairs:
-        return [0]*n
-    A = np.zeros((len(pairs), n))
-    b = np.array(diffs)
-    for k, (i, j) in enumerate(pairs):
-        A[k, i] = 1
-        A[k, j] = -1
-    R, *_ = np.linalg.lstsq(A, b, rcond=None)
-    R = R - np.mean(R)
-    return R.tolist()
-
-def plot_elo_matrix(names, ratings):
-    plt.figure()
-    plt.bar(names, ratings)
-    plt.xticks(rotation=45)
-    plt.ylabel('Elo rating')
-    plt.title('All-vs-all Elo ratings')
-    plt.tight_layout()
-    plt.show()
-
-def main():
-    torch.set_num_threads(11)
-    torch.set_num_interop_threads(11)
-
-    n_playouts_list = [1, 5, 10, 20, 50]
-    elo_values = evaluate_elo(n_playouts_list, n_games=50)
-    print("Playouts:", n_playouts_list)
-    print("ELO ratings:", elo_values)
-    plot_elo(n_playouts_list, elo_values)
-
-    # all-vs-all tournament
-    agents = [RandomAgent(seed=0)] + [MCTSAgent(RandomAgent(seed=1), n) for n in n_playouts_list]
-    names = ['Random'] + [f'MCTS_{n}' for n in n_playouts_list]
-    print("Running all-vs-all tournament...")
-    results = all_vs_all(agents, names, n_games=30)
-    ratings = estimate_elo_matrix(results)
-    for name, r in zip(names, ratings):
-        print(f"{name}: {r:.1f}")
-    plot_elo_matrix(names, ratings)
-
-    # DL self-play training
-    print("Starting DL self-play training...")
-    elos, versions = train_selfplay(n_iters=100, games_per_iter=100, epochs=3, batch_size=32, lr=1e-5, buffer_max=10000)
-    print("DL Training Elo progression:", elos)
-    plot_dl_progress(elos)
-
-    # Deep learning agent modules
+# --- Neural Network ---
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, mlp_dim):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True) # Use batch_first=True
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -286,220 +150,189 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
         y = self.ln1(x)
-        y, _ = self.attn(y, y, y)
-        x = x + y
+        # Note: MHA expects query, key, value. For self-attention, they are the same.
+        attn_output, _ = self.attn(y, y, y)
+        x = x + attn_output
         y = self.mlp(self.ln2(x))
         return x + y
 
-class FourInARowNet(nn.Module):
-    """Transformer-based network for win-probability estimation."""
-    def __init__(self, dim=64, n_blocks=4, n_heads=4, mlp_dim=128):
+class ConnectFourNet(nn.Module, ValueEstimator):
+    """Transformer-based network for Connect Four score estimation."""
+    def __init__(self, dim=32, n_blocks=3, n_heads=4, mlp_dim=64):
         super().__init__()
-        # input features are fixed 64-dim: one-hot pos (42), self bit, opp bit, zeros (20)
+        self.width = FourInARow.WIDTH
+        self.height = FourInARow.HEIGHT
+        self.n_cells = self.width * self.height
+        self.dim = dim
+
+        # Embedding layer for each cell state (empty, mine, opponent's) -> dim
+        # We'll use 2 features per cell: my_piece, other_piece
+        self.cell_embed = nn.Linear(2, dim) 
+        
+        # Positional encoding (simple learned embedding for each position)
+        self.pos_embed = nn.Parameter(torch.randn(1, self.n_cells, dim) * 0.02)
+
         self.blocks = nn.ModuleList([
             TransformerBlock(dim, n_heads, mlp_dim) for _ in range(n_blocks)
         ])
-        self.head = nn.Sequential(
-            nn.Linear(dim * 42, 1),
-            nn.Sigmoid()
-        )
+        # Output score estimate (-1 to 1)
+        # Pool features across all cells before final linear layer
+        self.head = nn.Linear(dim * self.n_cells, 1) 
 
-    def forward(self, x):  # x: (batch, 42, dim)
-        x = x.permute(1, 0, 2)            # (42, batch, dim)
+    def embed(self, boards: list[FIARPosition]) -> torch.Tensor:
+        batch_size = len(boards)
+        # Create input tensor: (batch_size, n_cells, 2)
+        input_features = torch.zeros(batch_size, self.n_cells, 2, device=default_device)
+        for i, (my, other) in enumerate(boards):
+            for cell_idx in range(self.n_cells):
+                if my & (1 << cell_idx):
+                    input_features[i, cell_idx, 0] = 1.0
+                elif other & (1 << cell_idx):
+                    input_features[i, cell_idx, 1] = 1.0
+        
+        # Embed cell features: (batch_size, n_cells, dim)
+        x = self.cell_embed(input_features)
+        
+        # Add positional embedding: (batch_size, n_cells, dim)
+        x = x + self.pos_embed 
+        return x
+
+    def forward(self, x):  # x: (batch, n_cells, dim)
         for blk in self.blocks:
             x = blk(x)
-        x = x.permute(1, 0, 2)            # (batch, 42, dim)
+        
+        # Flatten features: (batch, n_cells * dim)
         batch_size, seq_len, d = x.shape
-        x = x.reshape(batch_size, seq_len * d)  # (batch, 42*dim)
-        prob = self.head(x)               # (batch, 1)
-        return prob.squeeze(-1)           # (batch,)
+        x = x.reshape(batch_size, seq_len * d) 
+        
+        # Final head for score
+        score = self.head(x)              # (batch, 1)
+        return torch.tanh(score.squeeze(-1)) # (batch,)
 
-class DLAgent:
-    """Agent using the network to pick moves (no search)."""
-    def __init__(self, net, device='cpu', with_exploration=False):
-        self.net = net
-        self.device = device
-        self.net.eval()
-        self.with_exploration = with_exploration
+    # --- ValueEstimator interface ---
+    def value(self, board: FIARPosition) -> float:
+        self.eval() # Set to evaluation mode
+        with torch.no_grad():
+            embedded_boards = self.embed([board]).to(default_device)
+            val = self.forward(embedded_boards).item()
+        return val
 
-    def select_move(self, board):
-        moves = board.legal_moves()
-        net_probs = {}
-        for m in moves:
-            bcopy = board.clone()
-            win, draw = bcopy.play_move(m)
-            state = board_to_tensor(bcopy).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                p_tensor = self.net(state)  # (1,) probability of win
-            net_probs[m] = p_tensor[0].item()
-        if self.with_exploration:
-            probs = {m: 0.01 + p**0.5 for m, p in net_probs.items()}
-            x = random.random() * sum(probs.values())
-            for m, p in probs.items():
-                x -= p
-                if x < 0:
-                    return m
-            raise Exception("Failed to select move")
-        else:
-            return max(net_probs, key=net_probs.get)
+    def value_batch(self, boards: list[FIARPosition]) -> list[float]:
+        if not boards:
+            return []
+        self.eval() # Set to evaluation mode
+        with torch.no_grad():
+            embedded_boards = self.embed(boards).to(default_device)
+            vals = self.forward(embedded_boards)
+        return vals.cpu().tolist()
 
-# Utilities for DL self-play and training
+    def parameters(self): # Required by some optimizers potentially
+        return super().parameters()
 
-def board_to_tensor(board):
-    """Convert board to tensor of shape (42,64):
-    one-hot pos(42), self-piece(1), opp-piece(1), zeros(20)."""
-    # flatten grid
-    flat = [cell for row in board.grid for cell in row]
-    # positional one-hot (42 x 42)
-    pos = torch.eye(42, dtype=torch.float32)
-    # piece presence bits
-    self_bits = torch.tensor([1.0 if v==1 else 0.0 for v in flat], dtype=torch.float32).unsqueeze(1)
-    opp_bits = torch.tensor([1.0 if v==-1 else 0.0 for v in flat], dtype=torch.float32).unsqueeze(1)
-    # padding zeros to reach 64 dims
-    pad = torch.zeros(42, 20, dtype=torch.float32)
-    # concatenate to (42, 64)
-    x = torch.cat([pos, self_bits, opp_bits, pad], dim=1)
-    return x
 
-def print_numbered_board(moves):
-    """Print a single final board with moves numbered on each cell."""
-    rows, cols = Board.ROWS, Board.COLS
-    n = len(moves)
-    width = len(str(n))
-    # track stack heights per column
-    heights = [0] * cols
-    # init grid with dots
-    grid = [[ '.' * width for _ in range(cols)] for _ in range(rows)]
-    for idx, col in enumerate(moves):
-        # compute row from bottom
-        row = rows - 1 - heights[col]
-        heights[col] += 1
-        grid[row][col] = str(idx+1).rjust(width)
-    # print rows top-down
-    for r in range(rows):
-        print(' '.join(grid[r]))
-    print()
+# --- Optimizer ---
+# Reusing TorchOptimizer from small_games, but defining it here for clarity if needed
+class TorchOptimizer(ValueOptimizer):
+    def __init__(self, lr: float, epochs: int, batch_size: int):
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
 
-def generate_selfplay_data(agent, n_games, show_games=False):
-    """Run self-play, collect (state, label) pairs for win-loss classification."""
-    data = []
-    for game_idx in range(n_games):
-        board = Board()
-        sim_id = 1
-        states = []  # (Board, sim_id)
-        moves = []
-        while True:
-            states.append((board.clone(), sim_id))
-            move = agent.select_move(board)
-            moves.append(move)
-            win, draw = board.play_move(move)
-            if win or draw:
-                # include final board position (after move) in states
-                # perspective has been inverted, so flip sim_id
-                states.append((board.clone(), -sim_id))
-                # print every 20th game
-                if show_games and game_idx % 20 == 19:
-                    print(f"---- Self-play Game {game_idx+1} ----")
-                    print_numbered_board(moves)
-                result = 1 if win else 0
-                for st, sid in states:
-                    label = result if sid == 1 else (1 - result)
-                    data.append((board_to_tensor(st), label))
-                break
-            sim_id *= -1
-    return data
+    def train(self, episodes: list[Episode], estimator: ConnectFourNet) -> None:
+        estimator.train() # Set to training mode
+        data = []
+        # Collect all (board, final_value_perspective) pairs from episodes
+        for ep in episodes:
+            final_value = ep.value
+            # Iterate backwards assigning credit
+            current_value = final_value
+            # Add last state first
+            data.append((ep.last_position, current_value))
+            # Step back through decisions
+            for i, (board, _) in enumerate(reversed(ep.decisions)):
+                 # Perspective flips at each step backwards
+                 current_value *= -1 
+                 data.append((board, current_value))
+                 
+        if not data: return # No data to train on
 
-def evaluate_agent_vs(agent, opponent, n_games=50):
-    """Return Elo rating difference of agent vs opponent."""
-    wins = draws = losses = 0
-    for i in range(n_games):
-        board = Board()
-        players = [agent, opponent] if i % 2 == 0 else [opponent, agent]
-        turn = 0
-        while True:
-            cur = players[turn % 2]
-            move = cur.select_move(board)
-            win, draw = board.play_move(move)
-            if win:
-                if cur is agent: wins += 1
-                else: losses += 1
-                break
-            if draw:
-                draws += 1
-                break
-            turn += 1
-    p = (wins + 0.5 * draws) / n_games
-    if p <= 0: return -float('inf')
-    if p >= 1: return float('inf')
-    return -400 * math.log10(1 / p - 1)
+        random.shuffle(data)
+        
+        # Prepare dataset for PyTorch
+        states_embedded = estimator.embed([board for board, _ in data]).to(default_device)
+        targets = torch.tensor([value for _, value in data], dtype=torch.float32, device=default_device)
+        
+        optimizer = torch.optim.Adam(estimator.parameters(), lr=self.lr) # Use Adam
+        criterion = nn.MSELoss()
+        
+        estimator.train() # Ensure model is in training mode
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            indices = torch.randperm(len(states_embedded)) # Shuffle indices each epoch
+            for i in range(0, len(states_embedded), self.batch_size):
+                batch_indices = indices[i:i+self.batch_size]
+                batch_states = states_embedded[batch_indices]
+                batch_targets = targets[batch_indices]
+                
+                preds = estimator(batch_states) # Pass embedded states
+                loss = criterion(preds, batch_targets)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            # print(f"Epoch {epoch+1}/{self.epochs}, Loss: {epoch_loss / (len(states_embedded)/self.batch_size)}")
 
-def train_selfplay(n_iters=5, games_per_iter=100, epochs=3, batch_size=32, lr=1e-3, buffer_max=10000):
-    """Run self-play training, return Elo progression and saved state_dicts."""
-    # use default selected device (MPS/CUDA/CPU)
-    device = default_device
-    net = FourInARowNet(n_blocks=2).to(device)
-    optimizer = optim.Adam(net.parameters(), lr=lr)
-    # use binary cross-entropy for single-sigmoid output
-    criterion = nn.BCELoss()
-    buffer = []
-    elos = []
-    versions = []
-    random_agent = RandomAgent(seed=0)
-    # Evaluate current net vs random
-    score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=50)
-    elos.append(score)
-    versions.append(net.state_dict())
-    print(f"Before training: Elo vs Random = {score:.1f}")
-    for it in range(1, n_iters + 1):
-        try:
-            agent = DLAgent(net, device, with_exploration=True)
-            data = generate_selfplay_data(agent, games_per_iter)
-            buffer += data
-            if len(buffer) > buffer_max:
-                buffer = buffer[-buffer_max:]
-            # Training epochs
-            for epoch in range(1, epochs+1):
-                net.train()
-                random.shuffle(buffer)
-                running_loss = 0.0
-                correct = 0
-                total = 0
-                for i in range(0, len(buffer), batch_size):
-                    batch = buffer[i:i+batch_size]
-                    states = torch.stack([s for s, _ in batch]).to(device)
-                    labels = torch.tensor([l for _, l in batch], dtype=torch.float32).to(device)
-                    preds = net(states)
-                    loss = criterion(preds, labels)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    # accumulate loss and accuracy
-                    running_loss += loss.item() * labels.size(0)
-                    preds_label = (preds >= 0.5).float()
-                    correct += (preds_label == labels).sum().item()
-                    total += labels.size(0)
-                epoch_loss = running_loss / total
-                epoch_acc = correct / total
-                print(f"Iteration {it}, Epoch {epoch}: loss={epoch_loss:.4f}, acc={epoch_acc:.3f}")
-            net.eval()
-            # Evaluate current net vs random
-            score = evaluate_agent_vs(DLAgent(net, device), random_agent, n_games=200)
-            elos.append(score)
-            versions.append(net.state_dict())
-            print(f"Iteration {it}: Elo vs Random = {score:.1f}")
-        except KeyboardInterrupt:
-            print("Training interrupted by user")
-            break
-    return elos, versions
 
-def plot_dl_progress(elos):
-    plt.figure()
-    plt.plot(range(len(elos)), elos, marker='o')
-    plt.xlabel('Iteration')
-    plt.ylabel('Elo vs Random')
-    plt.title('DL Agent Training Progress')
-    plt.grid(True)
-    plt.show()
+# --- Main Execution ---
+
+def main():
+    parser = argparse.ArgumentParser(description='Train Four-in-a-Row AI using a Transformer network.')
+    parser.add_argument('--exploration-rate', type=float, default=0.3, help='Exploration rate for training')
+    parser.add_argument('--n-iters', type=int, default=100, help='Number of training iterations')
+    parser.add_argument('--n-games-per-iter', type=int, default=100, help='Number of games to play per iteration')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate') # Lower LR for Adam
+    parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs per iteration')
+    parser.add_argument('--batch-size', type=int, default=64, help='Training batch size')
+    parser.add_argument('--n-blocks', type=int, default=3, help='Number of transformer blocks')
+    parser.add_argument('--n-heads', type=int, default=4, help='Number of attention heads')
+    parser.add_argument('--dim', type=int, default=32, help='Transformer dimension')
+    parser.add_argument('--mlp-dim', type=int, default=64, help='MLP dimension in transformer')
+    # Removed n-workers as parallel simulation is now in base.train_self_play if needed
+    # parser.add_argument('--n-workers', type=int, default=4, help='Number of parallel workers for self-play simulation')
+    args = parser.parse_args()
+
+    random.seed(123)
+    torch.manual_seed(123)
+    
+    game = FourInARow()
+    
+    evaluate_against_random(game, RandomPlayer(game), "Random Baseline")
+    # Optimal player is not feasible for Connect Four
+
+    estimator = ConnectFourNet(
+        dim=args.dim, 
+        n_blocks=args.n_blocks, 
+        n_heads=args.n_heads, 
+        mlp_dim=args.mlp_dim
+    ).to(default_device)
+
+    optimizer = TorchOptimizer(
+        lr=args.lr, 
+        epochs=args.epochs, 
+        batch_size=args.batch_size
+    )
+
+    print("Starting training...")
+    train_self_play(
+        game=game, 
+        n_iters=args.n_iters, 
+        n_games_per_iter=args.n_games_per_iter, 
+        estimator=estimator, 
+        exploration_rate=args.exploration_rate, 
+        optimizer=optimizer
+        # n_workers=args.n_workers # Pass if train_self_play accepts it
+    )
 
 if __name__ == '__main__':
     main()
