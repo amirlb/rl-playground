@@ -72,6 +72,9 @@ class PytorchVectorValueEstimator(ValueEstimator):
     def value(self, board: TTTPosition) -> float:
         return self.values[self.index[board]]
 
+    def parameters(self):
+        return [self.values]
+
 
 class ValueOptimizer:
     def train(self, episodes: list[Episode], estimator: ValueEstimator) -> None:
@@ -88,6 +91,8 @@ def train_self_play(game: Game, n_iters: int, n_games_per_iter: int, estimator: 
 
 
 class OptimizerNaive1(ValueOptimizer):
+    # Additive update
+
     def __init__(self, max_diff: float):
         self.max_diff = max_diff
 
@@ -105,10 +110,11 @@ class OptimizerNaive1(ValueOptimizer):
         elif d < -self.max_diff:
             d = -self.max_diff
         estimator.values[i] += d
-        assert -1 <= estimator.values[i] <= 1
 
 
 class OptimizerNaive2(ValueOptimizer):
+    # Hand-implemented gradient descent
+
     def __init__(self, m: float):
         self.m = m
 
@@ -121,10 +127,11 @@ class OptimizerNaive2(ValueOptimizer):
     def update_towards(self, estimator: VectorValueEstimator, board: TTTPosition, new_value: float) -> None:
         i = estimator.index[board]
         estimator.values[i] = (1 - self.m) * estimator.values[i] + self.m * new_value
-        assert -1 <= estimator.values[i] <= 1
 
 
 class OptimizerNaive3(ValueOptimizer):
+    # Simple gradient descent on the value
+
     def __init__(self, lr: float):
         self.lr = lr
 
@@ -139,12 +146,61 @@ class OptimizerNaive3(ValueOptimizer):
         indices = torch.tensor(indices, dtype=torch.long)
         targets = torch.tensor(targets, dtype=torch.float32)
 
-        optimizer = torch.optim.SGD([estimator.values], lr=self.lr)
-        preds = estimator.values[indices]
-        loss = nn.MSELoss()(preds, targets)
+        optimizer = torch.optim.SGD(estimator.parameters(), lr=self.lr)
+        loss = nn.MSELoss()(estimator.values[indices], targets)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+
+class OptimizerNaive4(ValueOptimizer):
+    # TD on the value function using SGD
+
+    def __init__(self, lr: float):
+        self.lr = lr
+
+    def train(self, episodes: list[Episode], estimator: PytorchVectorValueEstimator) -> None:
+        indices, targets = [], []
+        intermed1, intermed2 = [], []
+        for ep in episodes:
+            for i, (board, _) in enumerate(ep.decisions):
+                intermed1.append(estimator.index[board])
+                if i > 0:
+                    intermed2.append(estimator.index[board])
+            indices.append(estimator.index[ep.last_position])
+            targets.append(ep.value * (-1)**len(ep.decisions))
+            intermed2.append(estimator.index[ep.last_position])
+        indices = torch.tensor(indices, dtype=torch.long)
+        targets = torch.tensor(targets, dtype=torch.float32)
+        intermed1 = torch.tensor(intermed1, dtype=torch.long)
+        intermed2 = torch.tensor(intermed2, dtype=torch.long)
+        intermed_targets = torch.zeros(len(intermed2), dtype=torch.float32)
+
+        optimizer = torch.optim.SGD(estimator.parameters(), lr=self.lr)
+        optimizer.zero_grad()
+        preds = estimator.values[indices]
+        nn.MSELoss()(preds, targets).backward()
+        preds = estimator.values[intermed1] + estimator.values[intermed2]
+        nn.MSELoss()(preds, intermed_targets).backward()
+        optimizer.step()
+
+
+class OptimizerNaive5(ValueOptimizer):
+    # Naive TD on the value function
+
+    def __init__(self, m: float):
+        self.m = m
+
+    def train(self, episodes: list[Episode], estimator: PytorchVectorValueEstimator) -> None:
+        for ep in episodes:
+            trajectory = [board for board, _ in ep.decisions] + [ep.last_position]
+            self.update_towards(estimator, ep.last_position, ep.value * (-1)**len(ep.decisions))
+            for i in reversed(range(1, len(trajectory))):
+                self.update_towards(estimator, trajectory[i-1], -estimator.value(trajectory[i]))
+
+    def update_towards(self, estimator: VectorValueEstimator, board: TTTPosition, new_value: float) -> None:
+        i = estimator.index[board]
+        estimator.values[i] = (1 - self.m) * estimator.values[i] + self.m * new_value
 
 
 class TransformerBlock(nn.Module):
@@ -239,13 +295,18 @@ def main():
     random.seed(123)
     evaluate_player(RandomPlayer(TicTacToeGame), "Random")
     evaluate_player(ValuePlayer(TicTacToeGame, OptimalValueEstimator(TicTacToeGame)), "Optimal")
-    # estimator = VectorValueEstimator()
-    # train_self_play(TicTacToeGame, n_iters=500, n_games_per_iter=10, exploration_rate=0.2, optimizer=OptimizerNaive1(max_diff=0.1), estimator=estimator)
-    # train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=OptimizerNaive2(m=0.1), estimator=estimator)
-    # estimator = PytorchVectorValueEstimator()
-    # train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=OptimizerNaive3(lr=0.05), estimator=estimator)
-    estimator = DLValueEstimator(n_blocks=1).to(default_device)
-    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.2, optimizer=DLOptimizer(lr=0.1, epochs=3), estimator=estimator)
+    estimator = VectorValueEstimator()
+    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive1(max_diff=0.1), estimator=estimator)
+    estimator = VectorValueEstimator()
+    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive2(m=0.1), estimator=estimator)
+    estimator = VectorValueEstimator()
+    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive5(m=0.1), estimator=estimator)
+    estimator = PytorchVectorValueEstimator()
+    train_self_play(TicTacToeGame, n_iters=100, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive3(lr=0.05), estimator=estimator)
+    estimator = PytorchVectorValueEstimator()
+    train_self_play(TicTacToeGame, n_iters=100, n_games_per_iter=100, exploration_rate=0.4, optimizer=OptimizerNaive4(lr=0.05), estimator=estimator)
+    estimator = DLValueEstimator(n_blocks=0).to(default_device)
+    train_self_play(TicTacToeGame, n_iters=50, n_games_per_iter=100, exploration_rate=0.4, optimizer=DLOptimizer(lr=0.1, epochs=1), estimator=estimator)
 
 
 if __name__ == '__main__':
